@@ -1,11 +1,21 @@
 """Core business logic services for the privacy engine.
 
-Contains five service classes:
+Contains ten service classes:
+
+Original five:
 - BudgetService: per-tenant budget allocation and tracking
 - MechanismService: DP mechanism application and validation
 - CompositionService: sequential/parallel/Rényi composition theorems
 - ProofService: formal mathematical proof generation and verification
 - VisualizationService: privacy loss curve and budget utilization charts
+
+New domain-specific services (wiring adapter modules):
+- EpsilonAccountingService: ε/δ ledger management via EpsilonAccountant adapter
+- MomentAccountingService: Rényi DP tracking via MomentAccountant adapter
+- SensitivityService: auto clip bounds via SensitivityAnalyzer adapter
+- AmplificationService: subsampling/shuffling amplification via PrivacyAmplifier adapter
+- AuditService: PIA report generation via AuditReporter adapter
+- OpenDPService: OpenDP framework integration via OpenDPAdapter
 
 All services are async-first and depend on injected repositories and adapters.
 They contain NO framework code — pure business logic with typed interfaces.
@@ -1182,3 +1192,694 @@ class VisualizationService:
             output_format=output_format,
             data=encoded,
         )
+
+
+# ---------------------------------------------------------------------------
+# New domain-specific service wrappers introduced in adapter expansion
+# ---------------------------------------------------------------------------
+
+
+class EpsilonAccountingService:
+    """Service facade over EpsilonAccountant adapter for ε/δ budget ledger management.
+
+    Bridges the existing BudgetService (database-backed) with the in-process
+    EpsilonAccountant (fast, analytics-capable). Used for:
+    - Generating audit certificates without additional DB round-trips
+    - Per-sensitivity-tier policy enforcement
+    - Analytics dashboards (budget projection, per-engine breakdown)
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        """Initialize with injected settings.
+
+        Args:
+            settings: Privacy engine configuration (total_epsilon, budget_renewal_days, etc.).
+        """
+        from aumos_privacy_engine.adapters.epsilon_accountant import EpsilonAccountant
+
+        self._settings = settings
+        self._accountant = EpsilonAccountant(
+            total_epsilon=settings.default_epsilon,
+            total_delta=settings.default_delta,
+            budget_period_days=settings.budget_renewal_days,
+        )
+        logger.info(
+            "EpsilonAccountingService initialized",
+            default_epsilon=settings.default_epsilon,
+            default_delta=settings.default_delta,
+        )
+
+    def ensure_tenant_initialized(self, tenant_id: UUID, sensitivity_tier: str = "internal") -> None:
+        """Ensure the tenant has an active in-process budget record.
+
+        Args:
+            tenant_id: Tenant to initialize.
+            sensitivity_tier: Data sensitivity tier for the tenant.
+        """
+        self._accountant.initialize_tenant(tenant_id, sensitivity_tier)
+
+    def record_operation(
+        self,
+        tenant_id: UUID,
+        epsilon_consumed: float,
+        delta_consumed: float,
+        source_engine: str,
+        query_label: str,
+        sensitivity_tier: str = "internal",
+        operation_id: UUID | None = None,
+    ) -> None:
+        """Record a privacy operation in the in-process ledger.
+
+        Args:
+            tenant_id: Tenant consuming budget.
+            epsilon_consumed: Epsilon consumed.
+            delta_consumed: Delta consumed.
+            source_engine: Synthesis engine name.
+            query_label: Human-readable query label.
+            sensitivity_tier: Data sensitivity tier.
+            operation_id: Optional linked PrivacyOperation UUID.
+        """
+        self.ensure_tenant_initialized(tenant_id, sensitivity_tier)
+        self._accountant.record_consumption(
+            tenant_id=tenant_id,
+            epsilon_consumed=epsilon_consumed,
+            delta_consumed=delta_consumed,
+            query_label=query_label,
+            source_engine=source_engine,
+            sensitivity_tier=sensitivity_tier,
+            operation_id=operation_id,
+        )
+
+    def get_analytics(self, tenant_id: UUID) -> dict:  # type: ignore[type-arg]
+        """Get usage analytics for a tenant.
+
+        Args:
+            tenant_id: Tenant to analyze.
+
+        Returns:
+            Analytics dictionary with usage breakdown and projections.
+        """
+        self.ensure_tenant_initialized(tenant_id)
+        return self._accountant.get_usage_analytics(tenant_id)
+
+    def generate_certificate(
+        self,
+        tenant_id: UUID,
+        certifier_id: str = "aumos-privacy-engine",
+    ) -> dict:  # type: ignore[type-arg]
+        """Generate a budget audit certificate for a tenant.
+
+        Args:
+            tenant_id: Tenant to certify.
+            certifier_id: Certifying system identifier.
+
+        Returns:
+            Certificate dictionary with verification_hash.
+        """
+        self.ensure_tenant_initialized(tenant_id)
+        return self._accountant.generate_budget_certificate(tenant_id, certifier_id)
+
+    def check_policy(
+        self,
+        tenant_id: UUID,
+        requested_epsilon: float,
+        sensitivity_tier: str = "internal",
+    ) -> bool:
+        """Check budget policy before committing a consumption.
+
+        Args:
+            tenant_id: Tenant requesting consumption.
+            requested_epsilon: Epsilon the operation wants to consume.
+            sensitivity_tier: Data sensitivity tier.
+
+        Returns:
+            True if within policy.
+        """
+        self.ensure_tenant_initialized(tenant_id, sensitivity_tier)
+        return self._accountant.apply_budget_policy(tenant_id, requested_epsilon, sensitivity_tier)
+
+
+class MomentAccountingService:
+    """Service facade over MomentAccountant adapter for Rényi DP tracking.
+
+    Used by CompositionService's advanced_compose_rdp path to provide
+    tight composition bounds for Gaussian and subsampled Gaussian mechanisms.
+    Each tenant maintains a per-period moments accumulator.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        """Initialize with injected settings.
+
+        Args:
+            settings: Privacy engine configuration (renyi_alpha, etc.).
+        """
+        from aumos_privacy_engine.adapters.moment_accountant import MomentAccountant
+
+        self._settings = settings
+        self._accountant = MomentAccountant()
+
+        logger.info(
+            "MomentAccountingService initialized",
+            default_alpha=settings.renyi_alpha,
+        )
+
+    def initialize_tenant(self, tenant_id: UUID) -> None:
+        """Initialize RDP moment tracking for a new tenant.
+
+        Args:
+            tenant_id: Tenant to initialize.
+        """
+        self._accountant.initialize_tenant(str(tenant_id))
+
+    def accumulate_gaussian(
+        self,
+        tenant_id: UUID,
+        sigma: float,
+        sensitivity: float = 1.0,
+        num_steps: int = 1,
+    ) -> None:
+        """Accumulate RDP moments for a Gaussian mechanism application.
+
+        Args:
+            tenant_id: Tenant accumulating budget.
+            sigma: Gaussian noise standard deviation.
+            sensitivity: L2 sensitivity.
+            num_steps: Number of mechanism applications.
+        """
+        tenant_key = str(tenant_id)
+        # Auto-initialize if not present
+        if tenant_key not in self._accountant._rdp_moments:
+            self._accountant.initialize_tenant(tenant_key)
+        self._accountant.accumulate_gaussian(tenant_key, sigma, sensitivity, num_steps)
+
+    def accumulate_subsampled_gaussian(
+        self,
+        tenant_id: UUID,
+        sigma: float,
+        sampling_rate: float,
+        num_steps: int = 1,
+    ) -> None:
+        """Accumulate RDP moments for a subsampled Gaussian mechanism.
+
+        Args:
+            tenant_id: Tenant accumulating budget.
+            sigma: Gaussian noise standard deviation.
+            sampling_rate: Poisson subsampling rate.
+            num_steps: Number of mechanism applications.
+        """
+        tenant_key = str(tenant_id)
+        if tenant_key not in self._accountant._rdp_moments:
+            self._accountant.initialize_tenant(tenant_key)
+        self._accountant.accumulate_subsampled_gaussian(tenant_key, sigma, sampling_rate, num_steps)
+
+    async def convert_to_dp(
+        self,
+        tenant_id: UUID,
+        target_delta: float | None = None,
+    ) -> tuple[float, float]:
+        """Convert accumulated RDP moments to (ε, δ)-DP guarantee.
+
+        Args:
+            tenant_id: Tenant to convert.
+            target_delta: Target delta (defaults to settings.default_delta).
+
+        Returns:
+            Tuple of (epsilon, delta).
+        """
+        effective_delta = target_delta if target_delta is not None else self._settings.default_delta
+        return await self._accountant.async_rdp_to_dp(str(tenant_id), effective_delta)
+
+    def get_moments_summary(self, tenant_id: UUID) -> dict:  # type: ignore[type-arg]
+        """Get the current accumulated RDP moments for a tenant.
+
+        Args:
+            tenant_id: Tenant to summarize.
+
+        Returns:
+            Dictionary with alpha orders, accumulated RDP values, and step count.
+        """
+        return self._accountant.get_moments_summary(str(tenant_id))
+
+    def reset_for_period(self, tenant_id: UUID) -> None:
+        """Reset all accumulated moments on budget renewal.
+
+        Args:
+            tenant_id: Tenant to reset.
+        """
+        self._accountant.reset_tenant(str(tenant_id))
+
+
+class SensitivityService:
+    """Service facade over SensitivityAnalyzer adapter.
+
+    Provides automatic clipping bound recommendations and sensitivity
+    profiling for synthesis engines before they request budget allocation.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        """Initialize with injected settings.
+
+        Args:
+            settings: Privacy engine configuration.
+        """
+        from aumos_privacy_engine.adapters.sensitivity_analyzer import SensitivityAnalyzer
+
+        self._settings = settings
+        self._analyzer = SensitivityAnalyzer(
+            clip_percentile=99.0,
+            smooth_sensitivity_beta=0.1,
+        )
+
+    def get_global_sensitivity(
+        self,
+        query_type: str,
+        data_bound: float | None = None,
+        num_dimensions: int = 1,
+    ) -> dict:  # type: ignore[type-arg]
+        """Estimate global sensitivity for a query type.
+
+        Args:
+            query_type: Query type (count/sum/mean/median/histogram/gradient).
+            data_bound: Maximum absolute value per record.
+            num_dimensions: Number of dimensions.
+
+        Returns:
+            Dictionary with l1_sensitivity and l2_sensitivity.
+        """
+        return self._analyzer.estimate_global_sensitivity(query_type, data_bound, num_dimensions)
+
+    async def get_local_sensitivity(
+        self,
+        data: list[float],
+        query_type: str,
+        clip_bound: float | None = None,
+    ) -> float:
+        """Compute empirical local sensitivity for a dataset.
+
+        Args:
+            data: Dataset values.
+            query_type: Query type.
+            clip_bound: Optional clipping bound.
+
+        Returns:
+            Local sensitivity estimate.
+        """
+        return await self._analyzer.compute_local_sensitivity(data, query_type, clip_bound)
+
+    def get_clip_recommendation(
+        self,
+        data: list[float],
+        percentile: float | None = None,
+    ) -> dict:  # type: ignore[type-arg]
+        """Recommend a clipping bound for a dataset.
+
+        Args:
+            data: Dataset values.
+            percentile: Percentile for the clip bound.
+
+        Returns:
+            Dictionary with recommended_clip_bound and utility loss estimate.
+        """
+        return self._analyzer.recommend_clip_bound(data, percentile)
+
+    async def profile_tabular_dataset(
+        self,
+        column_data: dict,  # type: ignore[type-arg]
+        clip_percentile: float | None = None,
+    ) -> dict:  # type: ignore[type-arg]
+        """Profile per-column sensitivities in a tabular dataset.
+
+        Args:
+            column_data: Dictionary mapping column name to list of numeric values.
+            clip_percentile: Clip percentile override.
+
+        Returns:
+            Per-column sensitivity profiles and dataset-level aggregate.
+        """
+        return await self._analyzer.profile_tabular_columns(column_data, clip_percentile)
+
+
+class AmplificationService:
+    """Service facade over PrivacyAmplifier adapter.
+
+    Used by synthesis engines that apply DP mechanisms to subsampled data
+    (e.g., mini-batch gradient updates in DP-SGD) to compute the tighter
+    amplified epsilon for budget accounting.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        """Initialize with injected settings.
+
+        Args:
+            settings: Privacy engine configuration.
+        """
+        from aumos_privacy_engine.adapters.privacy_amplifier import PrivacyAmplifier
+
+        self._settings = settings
+        self._amplifier = PrivacyAmplifier()
+
+    def compute_poisson_amplification(
+        self,
+        epsilon: float,
+        sampling_rate: float,
+    ) -> float:
+        """Compute amplified epsilon via Poisson subsampling.
+
+        Args:
+            epsilon: Original mechanism epsilon.
+            sampling_rate: Poisson sampling rate q ∈ (0, 1].
+
+        Returns:
+            Amplified epsilon for the full dataset.
+        """
+        return self._amplifier.amplify_epsilon_poisson(epsilon, sampling_rate)
+
+    def compute_fixed_size_amplification(
+        self,
+        epsilon: float,
+        sample_size: int,
+        dataset_size: int,
+    ) -> float:
+        """Compute amplified epsilon via fixed-size subsampling.
+
+        Args:
+            epsilon: Original mechanism epsilon.
+            sample_size: Number of records sampled.
+            dataset_size: Total dataset size.
+
+        Returns:
+            Amplified epsilon.
+        """
+        return self._amplifier.amplify_epsilon_fixed_size(epsilon, sample_size, dataset_size)
+
+    def compute_shuffle_amplification(
+        self,
+        epsilon_local: float,
+        num_users: int,
+        delta: float | None = None,
+    ) -> tuple[float, float]:
+        """Compute amplified (ε, δ) via shuffling (PRISM model).
+
+        Args:
+            epsilon_local: Local epsilon per user.
+            num_users: Number of participating users.
+            delta: Target delta (defaults to settings.default_delta).
+
+        Returns:
+            Tuple of (central_epsilon, delta).
+        """
+        effective_delta = delta if delta is not None else self._settings.default_delta
+        return self._amplifier.amplify_epsilon_shuffling(epsilon_local, num_users, effective_delta)
+
+    def recommend_batch_size(
+        self,
+        target_epsilon: float,
+        mechanism_epsilon: float,
+        dataset_size: int,
+        num_epochs: int = 1,
+        delta: float | None = None,
+    ) -> dict:  # type: ignore[type-arg]
+        """Recommend optimal batch size to achieve a target epsilon budget.
+
+        Args:
+            target_epsilon: Desired total epsilon budget.
+            mechanism_epsilon: Per-step mechanism epsilon.
+            dataset_size: Total number of records.
+            num_epochs: Number of full dataset passes.
+            delta: Target delta.
+
+        Returns:
+            Dictionary with recommended_batch_size and training parameters.
+        """
+        effective_delta = delta if delta is not None else self._settings.default_delta
+        return self._amplifier.optimal_batch_size_for_epsilon(
+            target_epsilon=target_epsilon,
+            mechanism_epsilon=mechanism_epsilon,
+            dataset_size=dataset_size,
+            num_epochs=num_epochs,
+            delta=effective_delta,
+        )
+
+
+class AuditService:
+    """Service facade over FormalProver and PrivacyAuditReporter adapters.
+
+    Provides comprehensive audit report generation and proof chain validation
+    for regulatory compliance. Combines FormalProver (per-operation proofs and
+    chain certificates) with PrivacyAuditReporter (PIA reports and risk scoring).
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        """Initialize with injected settings.
+
+        Args:
+            settings: Privacy engine configuration.
+        """
+        from aumos_privacy_engine.adapters.audit_reporter import PrivacyAuditReporter
+        from aumos_privacy_engine.adapters.formal_prover import FormalProver
+
+        self._settings = settings
+        self._prover = FormalProver(
+            max_operation_epsilon=settings.max_operation_epsilon,
+            issuer_id="aumos-privacy-engine",
+        )
+        self._reporter = PrivacyAuditReporter(
+            max_epsilon=settings.default_epsilon,
+            healthcare_max_epsilon=settings.healthcare_max_epsilon,
+        )
+
+    def generate_operation_proof(
+        self,
+        mechanism: str,
+        epsilon: float,
+        delta: float,
+        sensitivity: float,
+        noise_scale: float,
+        composition_type: str,
+    ) -> dict:  # type: ignore[type-arg]
+        """Generate a formal proof for a single DP operation.
+
+        Args:
+            mechanism: DP mechanism name.
+            epsilon: Claimed epsilon.
+            delta: Claimed delta.
+            sensitivity: Query sensitivity.
+            noise_scale: Applied noise scale.
+            composition_type: Composition type.
+
+        Returns:
+            Complete proof dictionary with LaTeX, JSON tree, and verification hash.
+        """
+        return self._prover.generate_mechanism_proof(
+            mechanism=mechanism,
+            epsilon=epsilon,
+            delta=delta,
+            sensitivity=sensitivity,
+            noise_scale=noise_scale,
+            composition_type=composition_type,
+        )
+
+    def verify_operation_chain(
+        self,
+        operations: list[PrivacyOperation],
+        composition_type: str,
+    ) -> bool:
+        """Verify that a chain of operations satisfies the claimed DP bound.
+
+        Args:
+            operations: List of PrivacyOperation records to verify.
+            composition_type: Composition theorem applied.
+
+        Returns:
+            True if the chain is internally consistent.
+        """
+        return self._prover.verify_proof_chain(operations, composition_type)
+
+    def generate_chain_certificate(
+        self,
+        operations: list[PrivacyOperation],
+        composition_type: str,
+        tenant_id: UUID,
+        job_id: UUID,
+    ) -> dict:  # type: ignore[type-arg]
+        """Generate a chain certificate for all operations in a synthesis job.
+
+        Args:
+            operations: Ordered list of PrivacyOperation records.
+            composition_type: Composition theorem applied.
+            tenant_id: Owning tenant.
+            job_id: Synthesis job ID.
+
+        Returns:
+            Composite certificate with per-operation proofs and verification hash.
+        """
+        return self._prover.generate_chain_certificate(
+            operations=operations,
+            composition_type=composition_type,
+            tenant_id=tenant_id,
+            job_id=job_id,
+        )
+
+    def generate_pia_report(
+        self,
+        tenant_id: UUID,
+        budget: PrivacyBudget,
+        operations: list[PrivacyOperation],
+        dataset_name: str = "synthetic_dataset",
+        stakeholder_view: str = "technical",
+        regulations: list[str] | None = None,
+    ) -> dict:  # type: ignore[type-arg]
+        """Generate a full Privacy Impact Assessment report.
+
+        Args:
+            tenant_id: Tenant being audited.
+            budget: Current PrivacyBudget record.
+            operations: All PrivacyOperation records for the period.
+            dataset_name: Human-readable dataset name.
+            stakeholder_view: 'technical', 'executive', or 'regulatory'.
+            regulations: Regulations to check (GDPR, CCPA, HIPAA).
+
+        Returns:
+            Full PIA report as JSON-serializable dictionary.
+        """
+        return self._reporter.generate_pia_report(
+            tenant_id=tenant_id,
+            budget=budget,
+            operations=operations,
+            dataset_name=dataset_name,
+            stakeholder_view=stakeholder_view,
+            regulations=regulations,
+        )
+
+    def generate_json_pia(
+        self,
+        tenant_id: UUID,
+        budget: PrivacyBudget,
+        operations: list[PrivacyOperation],
+        dataset_name: str = "synthetic_dataset",
+    ) -> str:
+        """Generate a PIA report as a JSON string.
+
+        Args:
+            tenant_id: Tenant being audited.
+            budget: Current budget record.
+            operations: Privacy operations for the period.
+            dataset_name: Dataset name.
+
+        Returns:
+            JSON-serialized PIA report string.
+        """
+        return self._reporter.generate_json_report(
+            tenant_id=tenant_id,
+            budget=budget,
+            operations=operations,
+            dataset_name=dataset_name,
+        )
+
+    def compute_risk_score(
+        self,
+        total_epsilon: float,
+        num_operations: int,
+        source_engines: list[str],
+        is_healthcare: bool = False,
+    ) -> dict:  # type: ignore[type-arg]
+        """Compute a normalized privacy risk score for a tenant's usage.
+
+        Args:
+            total_epsilon: Total epsilon consumed.
+            num_operations: Number of DP operations performed.
+            source_engines: List of synthesis engines that consumed budget.
+            is_healthcare: Whether this involves healthcare (PHI) data.
+
+        Returns:
+            Dictionary with risk_score (0.0-1.0), risk_level, and contributing factors.
+        """
+        return self._reporter.compute_risk_score(
+            total_epsilon=total_epsilon,
+            num_operations=num_operations,
+            source_engines=source_engines,
+            is_healthcare=is_healthcare,
+        )
+
+
+class OpenDPService:
+    """Service facade over OpenDPAdapter for OpenDP framework integration.
+
+    Provides the canonical mechanism application entry point for all synthesis
+    engines. Uses OpenDP library primitives when available, with transparent
+    fallback to manually-implemented (mathematically equivalent) mechanisms.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        """Initialize with injected settings.
+
+        Args:
+            settings: Privacy engine configuration.
+        """
+        from aumos_privacy_engine.adapters.opendp_adapter import OpenDPAdapter
+
+        self._settings = settings
+        self._adapter = OpenDPAdapter(enable_fallback=True)
+
+        logger.info(
+            "OpenDPService initialized",
+            library_status=self._adapter.get_library_status(),
+        )
+
+    async def apply(
+        self,
+        data: list[float],
+        mechanism: str,
+        sensitivity: float,
+        epsilon: float,
+        delta: float,
+    ) -> tuple[list[float], Decimal, Decimal, Decimal]:
+        """Apply a DP mechanism via OpenDP and return privatized data.
+
+        Args:
+            data: Input numerical values.
+            mechanism: DP mechanism name (laplace/gaussian/subsampled).
+            sensitivity: Query sensitivity.
+            epsilon: Privacy budget.
+            delta: Failure probability.
+
+        Returns:
+            Tuple of (privatized_values, epsilon_consumed, delta_consumed, noise_scale).
+        """
+        result = await self._adapter.apply_mechanism(
+            data=data,
+            mechanism=mechanism,
+            sensitivity=sensitivity,
+            epsilon=epsilon,
+            delta=delta,
+        )
+        return (
+            result.privatized_values,
+            result.epsilon_consumed,
+            result.delta_consumed,
+            result.noise_scale,
+        )
+
+    def compose(
+        self,
+        measurements: list[dict],  # type: ignore[type-arg]
+        composition_type: str = "sequential",
+    ) -> dict:  # type: ignore[type-arg]
+        """Compute the total privacy cost of a composition of measurements.
+
+        Args:
+            measurements: List of measurement specs with keys: mechanism, epsilon, delta.
+            composition_type: Composition method: sequential | parallel.
+
+        Returns:
+            Dictionary with total_epsilon, total_delta, and composition_type.
+        """
+        return self._adapter.compose_measurements(measurements, composition_type)
+
+    def get_status(self) -> dict:  # type: ignore[type-arg]
+        """Return the current OpenDP library status.
+
+        Returns:
+            Dictionary with availability, version, and fallback status.
+        """
+        return self._adapter.get_library_status()
