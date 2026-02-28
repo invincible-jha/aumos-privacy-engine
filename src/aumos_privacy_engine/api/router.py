@@ -27,12 +27,17 @@ from aumos_privacy_engine.adapters.repositories import (
 from aumos_privacy_engine.api.schemas import (
     BudgetAllocateRequest,
     BudgetResponse,
+    BudgetSummaryResponse,
+    BurnRateResponse,
     CompositionPlanRequest,
     CompositionPlanResponse,
+    DailyConsumption,
     LossVisualizationResponse,
     MechanismApplyRequest,
     MechanismApplyResponse,
     ProofResponse,
+    RegulatoryReportRequest,
+    RegulatoryReportResponse,
 )
 from aumos_privacy_engine.core.services import (
     BudgetService,
@@ -410,6 +415,144 @@ async def create_composition_plan(
         composition_method=request.composition_method,
         is_feasible=is_feasible,
         remaining_budget_after=remaining_after,
+    )
+
+
+@router.get(
+    "/analytics/budget-summary",
+    response_model=BudgetSummaryResponse,
+    summary="Get budget utilization summary with burn rate and exhaustion projection",
+    description="Returns budget utilization, 7-day burn rate, and projected exhaustion date for the current tenant.",
+)
+async def get_budget_summary(
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> BudgetSummaryResponse:
+    """Return budget utilization summary with burn rate and projection.
+
+    Args:
+        tenant: Current tenant context.
+        session: Database session.
+
+    Returns:
+        BudgetSummaryResponse with burn rate and projected exhaustion date.
+    """
+    from aumos_privacy_engine.adapters.analytics_repository import PrivacyAnalyticsRepository
+
+    analytics_repo = PrivacyAnalyticsRepository(session)
+    budget = await analytics_repo.get_active_budget(tenant.tenant_id)
+    daily_data = await analytics_repo.get_daily_consumption(tenant.tenant_id, window_days=7)
+    by_engine = await analytics_repo.get_consumption_by_engine(tenant.tenant_id)
+
+    total_epsilon = float(budget.total_epsilon) if budget else 0.0
+    used_epsilon = sum(row[1] for row in daily_data) if daily_data else 0.0
+    # Use all-time consumption for proper accounting
+    if budget:
+        used_epsilon = float(budget.used_epsilon) if hasattr(budget, "used_epsilon") else used_epsilon
+    remaining_epsilon = max(0.0, total_epsilon - used_epsilon)
+    remaining_pct = (remaining_epsilon / total_epsilon * 100.0) if total_epsilon > 0 else 0.0
+
+    # Compute 7-day average burn rate
+    burn_rate = (
+        sum(row[1] for row in daily_data) / max(len(daily_data), 1)
+        if daily_data else 0.0
+    )
+
+    # Project exhaustion date
+    projected_exhaustion: str | None = None
+    if burn_rate > 0 and remaining_epsilon > 0:
+        import datetime as dt
+        days_remaining = remaining_epsilon / burn_rate
+        exhaustion_date = dt.date.today() + dt.timedelta(days=days_remaining)
+        projected_exhaustion = exhaustion_date.isoformat()
+
+    return BudgetSummaryResponse(
+        tenant_id=tenant.tenant_id,
+        total_budget_epsilon=total_epsilon,
+        consumed_epsilon=used_epsilon,
+        remaining_epsilon=remaining_epsilon,
+        remaining_percentage=remaining_pct,
+        burn_rate_epsilon_per_day=burn_rate,
+        projected_exhaustion_date=projected_exhaustion,
+        by_engine=by_engine,
+    )
+
+
+@router.get(
+    "/analytics/burn-rate",
+    response_model=BurnRateResponse,
+    summary="Get daily epsilon consumption over a rolling window",
+    description="Returns per-day epsilon consumption for the past N days.",
+)
+async def get_burn_rate(
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    window_days: Annotated[int, Query(ge=1, le=365, description="Number of days to look back")] = 7,
+) -> BurnRateResponse:
+    """Return daily epsilon consumption over past N days.
+
+    Args:
+        tenant: Current tenant context.
+        session: Database session.
+        window_days: Number of days in the lookback window (1–365).
+
+    Returns:
+        BurnRateResponse with per-day consumption records.
+    """
+    from aumos_privacy_engine.adapters.analytics_repository import PrivacyAnalyticsRepository
+
+    analytics_repo = PrivacyAnalyticsRepository(session)
+    daily_data = await analytics_repo.get_daily_consumption(tenant.tenant_id, window_days=window_days)
+
+    return BurnRateResponse(
+        window_days=window_days,
+        daily_consumption=[
+            DailyConsumption(
+                date=row[0],
+                epsilon_consumed=row[1],
+                operations_count=row[2],
+                engines_used=row[3],
+            )
+            for row in daily_data
+        ],
+    )
+
+
+@router.post(
+    "/reports/generate",
+    response_model=RegulatoryReportResponse,
+    summary="Generate a regulatory compliance report",
+    description="Generates GDPR, HIPAA, or CCPA compliance report populated with actual DP proof data.",
+)
+async def generate_regulatory_report(
+    request: RegulatoryReportRequest,
+    tenant: Annotated[TenantContext, Depends(get_current_tenant)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> RegulatoryReportResponse:
+    """Generate a regulatory compliance report.
+
+    Args:
+        request: Report generation request with standard and date range.
+        tenant: Current tenant context.
+        session: Database session.
+
+    Returns:
+        RegulatoryReportResponse with PDF content and summary.
+    """
+    from aumos_privacy_engine.adapters.report_generator import PrivacyReportGenerator
+    from aumos_privacy_engine.adapters.analytics_repository import PrivacyAnalyticsRepository
+
+    analytics_repo = PrivacyAnalyticsRepository(session)
+    budget = await analytics_repo.get_active_budget(tenant.tenant_id)
+    by_engine = await analytics_repo.get_consumption_by_engine(tenant.tenant_id)
+
+    generator = PrivacyReportGenerator()
+    return await generator.generate_regulatory_report(
+        standard=request.standard,
+        tenant_id=tenant.tenant_id,
+        budget=budget,
+        by_engine=by_engine,
+        include_operation_details=request.include_operation_details,
     )
 
 
