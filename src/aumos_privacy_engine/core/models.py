@@ -226,6 +226,52 @@ class PrivacyOperation(AumOSModel):
     budget: Mapped["PrivacyBudget"] = relationship("PrivacyBudget", back_populates="operations")
 
 
+class PrivacyBudgetRenewalPolicy(AumOSModel):
+    """Tenant-configurable privacy budget auto-renewal policy (GAP-97).
+
+    Defines when and how much to add to a tenant's privacy budget automatically.
+    Renewal is triggered by a scheduled background task (APScheduler).
+
+    Attributes:
+        tenant_id: Owning tenant UUID (inherited from AumOSModel).
+        cadence: How often to renew ("weekly" | "monthly" | "quarterly").
+        renewal_epsilon: Epsilon amount to add on each renewal.
+        alert_thresholds: Budget remaining fractions that trigger alerts.
+        next_renewal_at: When the next renewal will occur.
+        is_active: Whether this policy is currently active.
+    """
+
+    __tablename__ = "prv_budget_renewal_policies"
+
+    cadence: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        comment="Renewal cadence: weekly | monthly | quarterly",
+    )
+    renewal_epsilon: Mapped[Decimal] = mapped_column(
+        Numeric(precision=10, scale=6),
+        nullable=False,
+        comment="Epsilon amount to add on each renewal cycle",
+    )
+    alert_thresholds: Mapped[list] = mapped_column(  # type: ignore[type-arg]
+        JSONB,
+        nullable=False,
+        default=lambda: [0.1, 0.05, 0.01],
+        comment="Remaining budget fractions that trigger alert events [0.10, 0.05, 0.01]",
+    )
+    next_renewal_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="UTC timestamp of the next scheduled renewal",
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Whether this renewal policy is currently active",
+    )
+
+
 class CompositionPlan(AumOSModel):
     """Multi-step DP composition plan for budget forecasting.
 

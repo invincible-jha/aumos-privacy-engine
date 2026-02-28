@@ -281,6 +281,151 @@ class CompositionPlanResponse(BaseModel):
     remaining_budget_after: float | None = None
 
 
+class DailyConsumption(BaseModel):
+    """Per-day budget consumption record for burn rate analytics (GAP-95).
+
+    Attributes:
+        date: The calendar date.
+        epsilon_consumed: Total epsilon consumed on this day.
+        operations_count: Number of privacy operations on this day.
+        engines_used: List of synthesis engines that consumed budget.
+    """
+
+    date: str  # ISO date string YYYY-MM-DD
+    epsilon_consumed: float
+    operations_count: int
+    engines_used: list[str]
+
+
+class BudgetSummaryResponse(BaseModel):
+    """Budget utilization summary with burn rate and exhaustion projection (GAP-95).
+
+    Attributes:
+        tenant_id: The owning tenant.
+        total_budget_epsilon: Total epsilon allocated for current period.
+        consumed_epsilon: Epsilon consumed so far.
+        remaining_epsilon: Epsilon still available.
+        remaining_percentage: Percentage of budget still remaining (0–100).
+        burn_rate_epsilon_per_day: Rolling 7-day average epsilon consumption per day.
+        projected_exhaustion_date: Estimated date budget runs out (None if burn rate is 0).
+        by_engine: Per-engine epsilon consumption breakdown.
+    """
+
+    tenant_id: uuid.UUID
+    total_budget_epsilon: float
+    consumed_epsilon: float
+    remaining_epsilon: float
+    remaining_percentage: float
+    burn_rate_epsilon_per_day: float
+    projected_exhaustion_date: str | None = None  # ISO date string
+    by_engine: dict[str, float]
+
+
+class BurnRateResponse(BaseModel):
+    """Daily epsilon consumption over a rolling window (GAP-95).
+
+    Attributes:
+        window_days: Number of days in the analysis window.
+        daily_consumption: Per-day consumption records.
+    """
+
+    window_days: int
+    daily_consumption: list[DailyConsumption]
+
+
+class RegulatoryReportRequest(BaseModel):
+    """Request to generate a regulatory compliance report (GAP-96).
+
+    Attributes:
+        standard: Regulatory standard for the report.
+        start_date: Beginning of the reporting period (ISO date).
+        end_date: End of the reporting period (ISO date).
+        include_operation_details: Whether to include per-operation details.
+    """
+
+    standard: Literal["gdpr", "hipaa", "ccpa"] = "gdpr"
+    start_date: str | None = None
+    end_date: str | None = None
+    include_operation_details: bool = False
+
+
+class RegulatoryReportResponse(BaseModel):
+    """Response containing a generated regulatory compliance report (GAP-96).
+
+    Attributes:
+        report_id: Unique ID of the generated report.
+        standard: Regulatory standard used.
+        tenant_id: The tenant this report covers.
+        generated_at: When the report was generated.
+        report_uri: MinIO URI of the generated PDF.
+        summary: Brief summary of compliance status.
+    """
+
+    report_id: uuid.UUID
+    standard: str
+    tenant_id: uuid.UUID
+    generated_at: str
+    report_uri: str
+    summary: str
+
+
+class AccountantExportRequest(BaseModel):
+    """Request to export privacy accountant state (GAP-98).
+
+    Attributes:
+        format: Export format — "google_dp" or "tumult".
+        job_id: If provided, export only operations for this job.
+    """
+
+    format: Literal["google_dp", "tumult"] = "google_dp"
+    job_id: uuid.UUID | None = None
+
+
+class AccountantExportResponse(BaseModel):
+    """Response with exported accountant state (GAP-98).
+
+    Attributes:
+        format: Export format used.
+        tenant_id: The tenant this export covers.
+        operation_count: Number of operations exported.
+        exported_state: The exported state as a JSON-serializable dict.
+    """
+
+    format: str
+    tenant_id: uuid.UUID
+    operation_count: int
+    exported_state: dict[str, Any]
+
+
+class GroupPrivacyRequest(BaseModel):
+    """Request to apply group differential privacy (GAP-99).
+
+    Treats all records sharing a group_key as a single privacy unit,
+    adjusting sensitivity computations accordingly.
+
+    Attributes:
+        mechanism: DP mechanism to apply.
+        epsilon: Privacy budget for this operation.
+        delta: Failure probability.
+        group_key_column: Name of the column identifying groups.
+        max_group_size: Maximum records per group (for sensitivity calculation).
+        sensitivity: Per-record sensitivity (will be multiplied by max_group_size).
+        data: Numerical values to privatize.
+        source_engine: Which synthesis engine is making this request.
+        job_id: The synthesis job this operation belongs to.
+    """
+
+    mechanism: Literal["laplace", "gaussian", "exponential", "subsampled"]
+    epsilon: float = Field(gt=0.0, le=10.0)
+    delta: float = Field(default=0.0, ge=0.0, lt=1.0)
+    group_key_column: str = Field(max_length=100)
+    max_group_size: int = Field(gt=0, description="Maximum records per privacy group")
+    sensitivity: float = Field(gt=0.0, description="Per-record L1/L2 sensitivity")
+    data: list[float] = Field(min_length=1, max_length=100000)
+    source_engine: Literal["tabular", "text", "image", "audio", "video", "healthcare"]
+    job_id: uuid.UUID
+
+
 class LossVisualizationResponse(BaseModel):
     """Response containing a privacy loss curve visualization.
 
